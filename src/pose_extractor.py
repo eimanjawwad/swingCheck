@@ -2,21 +2,16 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import sys
+import time
 from pathlib import Path
-
-# NEW
-from mediapipe.tasks import python as mp_python
-from mediapipe.tasks.python import vision
 
 mp_pose = mp.solutions.pose
 mp_drawing = mp.solutions.drawing_utils
 mp_drawing_styles = mp.solutions.drawing_styles
 
 def extract_pose(video_path: str, output_path: str = None):
-    """
-    Run MediaPipe pose extraction on a video.
-    Saves annotated video and returns per-frame keypoint data.
-    """
+    t_start = time.time()
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise FileNotFoundError(f"Cannot open video: {video_path}")
@@ -30,11 +25,11 @@ def extract_pose(video_path: str, output_path: str = None):
 
     out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
 
-    all_keypoints = []   # list of dicts, one per frame
+    all_keypoints = []
 
     with mp_pose.Pose(
         static_image_mode=False,
-        model_complexity=2,       
+        model_complexity=2,
         smooth_landmarks=True,
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5
@@ -46,14 +41,12 @@ def extract_pose(video_path: str, output_path: str = None):
             if not ret:
                 break
 
-            # MediaPipe needs RGB
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = pose.process(rgb)
 
             frame_data = {"frame": frame_idx, "landmarks": None, "angles": None}
 
             if results.pose_landmarks:
-                # Draw skeleton overlay
                 mp_drawing.draw_landmarks(
                     frame,
                     results.pose_landmarks,
@@ -61,7 +54,6 @@ def extract_pose(video_path: str, output_path: str = None):
                     landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style()
                 )
 
-                # Extract raw landmark coords (normalized 0-1)
                 lm = results.pose_landmarks.landmark
                 keypoints = {
                     name: {
@@ -71,15 +63,11 @@ def extract_pose(video_path: str, output_path: str = None):
                     for name, idx in KEYPOINT_IDS.items()
                 }
 
-                # Compute joint angles
                 angles = compute_angles(keypoints, w, h)
                 frame_data["landmarks"] = keypoints
                 frame_data["angles"] = angles
-
-                # Overlay angle values on frame
                 overlay_angles(frame, angles, keypoints, w, h)
 
-            # Frame counter
             cv2.putText(frame, f"Frame {frame_idx}", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
 
@@ -89,11 +77,23 @@ def extract_pose(video_path: str, output_path: str = None):
 
     cap.release()
     out.release()
-    print(f"Done! Saved to {output_path} ({frame_idx} frames processed)")
-    return all_keypoints
+
+    t_total     = time.time() - t_start
+    t_per_frame = t_total / max(len(all_keypoints), 1)
+
+    print(f"✅ Done! Saved to {output_path} ({len(all_keypoints)} frames processed)")
+    print(f"⏱  Total time:     {t_total:.2f}s")
+    print(f"⏱  Per-frame:      {t_per_frame*1000:.1f}ms")
+    print(f"⏱  Effective FPS:  {1/t_per_frame:.1f}")
+
+    return all_keypoints, {
+        "total_s":      round(t_total, 2),
+        "per_frame_ms": round(t_per_frame * 1000, 1),
+        "fps":          round(1 / t_per_frame, 1),
+        "frames":       len(all_keypoints)
+    }
 
 
-# ── Key joints for tennis 
 KEYPOINT_IDS = {
     "left_shoulder":  11, "right_shoulder": 12,
     "left_elbow":     13, "right_elbow":    14,
@@ -105,7 +105,6 @@ KEYPOINT_IDS = {
 
 
 def angle_between(a, b, c):
-    """Angle at point b, given points a-b-c (in pixel coords)."""
     ba = np.array([a[0]-b[0], a[1]-b[1]], dtype=float)
     bc = np.array([c[0]-b[0], c[1]-b[1]], dtype=float)
     cos_a = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6)
@@ -113,34 +112,21 @@ def angle_between(a, b, c):
 
 
 def compute_angles(kp, w, h):
-    """Compute tennis-relevant joint angles from normalized keypoints."""
     def px(name):
         return (kp[name]["x"] * w, kp[name]["y"] * h)
-
     angles = {}
     try:
-        # Right elbow angle (shoulder → elbow → wrist)
-        angles["right_elbow"] = angle_between(
-            px("right_shoulder"), px("right_elbow"), px("right_wrist"))
-        # Left elbow
-        angles["left_elbow"] = angle_between(
-            px("left_shoulder"), px("left_elbow"), px("left_wrist"))
-        # Right shoulder (hip → shoulder → elbow)
-        angles["right_shoulder"] = angle_between(
-            px("right_hip"), px("right_shoulder"), px("right_elbow"))
-        # Right knee (hip → knee → ankle)
-        angles["right_knee"] = angle_between(
-            px("right_hip"), px("right_knee"), px("right_ankle"))
-        # Left knee
-        angles["left_knee"] = angle_between(
-            px("left_hip"), px("left_knee"), px("left_ankle"))
+        angles["right_elbow"]    = angle_between(px("right_shoulder"), px("right_elbow"),   px("right_wrist"))
+        angles["left_elbow"]     = angle_between(px("left_shoulder"),  px("left_elbow"),    px("left_wrist"))
+        angles["right_shoulder"] = angle_between(px("right_hip"),      px("right_shoulder"),px("right_elbow"))
+        angles["right_knee"]     = angle_between(px("right_hip"),      px("right_knee"),    px("right_ankle"))
+        angles["left_knee"]      = angle_between(px("left_hip"),       px("left_knee"),     px("left_ankle"))
     except Exception:
         pass
     return angles
 
 
 def overlay_angles(frame, angles, kp, w, h):
-    """Draw angle values next to the relevant joints."""
     label_positions = {
         "right_elbow":    ("right_elbow",    (15, 0)),
         "right_shoulder": ("right_shoulder", (15, 0)),
@@ -155,9 +141,8 @@ def overlay_angles(frame, angles, kp, w, h):
                     (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 200), 2)
 
 
-# Run
 if __name__ == "__main__":
-    video = sys.argv[1] if len(sys.argv) > 1 else "data/pro/forehand/clip1.mp4"
-    output = sys.argv[1].replace(".mp4", "_pose.mp4") if len(sys.argv) > 1 else "output/clip1_pose.mp4"
-    keypoints = extract_pose(video, output)
-    print(f"Extracted keypoints from {len(keypoints)} frames")
+    video  = sys.argv[1] if len(sys.argv) > 1 else "data/pro/forehand/clip1.mp4"
+    output = video.replace(".mp4", "_pose.mp4")
+    keypoints, timing = extract_pose(video, output)
+    print(f"Extracted keypoints from {timing['frames']} frames")
